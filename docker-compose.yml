@@ -1,0 +1,102 @@
+services:
+  ebpf:
+    image: ubuntu:24.04
+    container_name: claude2ebpf
+    hostname: ebpf-lab
+    privileged: true
+    pid: host
+    network_mode: host
+    volumes:
+      - /sys/kernel/debug:/sys/kernel/debug
+      - /sys/kernel/tracing:/sys/kernel/tracing
+      - /sys/fs/bpf:/sys/fs/bpf
+      - /lib/modules:/lib/modules:ro
+      - ./workspace:/workspace
+    environment:
+      - DEBIAN_FRONTEND=noninteractive
+      - TZ=Europe/Stockholm
+    working_dir: /workspace
+    stdin_open: true
+    tty: true
+    command:
+      - bash
+      - -c
+      - |
+        set -e
+        KVER=$$(uname -r)
+        ARCH=$$(uname -m | sed 's/aarch64/arm64/' | sed 's/x86_64/x86/')
+
+        echo "==> Installing eBPF toolchain..."
+        apt-get update
+        apt-get install -y --no-install-recommends \
+          bpftrace bpfcc-tools python3-bpfcc libbpf-dev \
+          clang llvm gcc make git curl kmod \
+          python3 python3-pip strace \
+          wget xz-utils flex bison bc libssl-dev
+
+        # Fetch kernel headers from kernel.org for Docker Desktop's LinuxKit kernel
+        # LinuxKit does not ship kernel headers, so we extract them from source
+        MAJOR=$$(echo $$KVER | cut -d. -f1)
+        MINOR=$$(echo $$KVER | cut -d. -f2)
+        PATCH=$$(echo $$KVER | cut -d. -f3 | cut -d- -f1)
+        KDIR="/usr/src/linux-headers-$$KVER"
+
+        if [ ! -f "$$KDIR/include/generated/autoconf.h" ]; then
+          echo "==> Fetching kernel $$MAJOR.$$MINOR.$$PATCH headers (LinuxKit has none)..."
+          cd /tmp
+          wget -q "https://cdn.kernel.org/pub/linux/kernel/v$$MAJOR.x/linux-$$MAJOR.$$MINOR.$$PATCH.tar.xz" -O kernel.tar.xz || \
+          wget -q "https://cdn.kernel.org/pub/linux/kernel/v$$MAJOR.x/linux-$$MAJOR.$$MINOR.tar.xz" -O kernel.tar.xz
+
+          mkdir -p "$$KDIR"
+          KSRC="linux-$$MAJOR.$$MINOR.$$PATCH"
+
+          # Extract include dirs, arch headers, scripts, Makefiles, Kconfigs, and kernel source for make prepare
+          tar xf kernel.tar.xz --strip-components=1 -C "$$KDIR" \
+            "$$KSRC/include" \
+            "$$KSRC/arch/$$ARCH/include" \
+            "$$KSRC/arch/$$ARCH/Makefile" \
+            "$$KSRC/arch/$$ARCH/tools" \
+            "$$KSRC/arch/$$ARCH/kernel" \
+            "$$KSRC/scripts" \
+            "$$KSRC/Makefile" \
+            "$$KSRC/Kbuild" \
+            "$$KSRC/kernel" \
+            "$$KSRC/tools/include" 2>/dev/null || true
+
+          # Extract all Kconfig files (needed for make olddefconfig)
+          tar xf kernel.tar.xz --strip-components=1 -C "$$KDIR" \
+            --wildcards '*/Kconfig*' 2>/dev/null || true
+
+          # Use the running kernel's config
+          cat /proc/config.gz | gunzip > "$$KDIR/.config"
+
+          # Generate required headers (autoconf.h, bounds.h, timeconst.h, asm-offsets.h, cpucap-defs.h)
+          cd "$$KDIR"
+          make ARCH=$$ARCH olddefconfig 2>/dev/null || true
+          make ARCH=$$ARCH prepare 2>/dev/null || true
+
+          rm -f /tmp/kernel.tar.xz
+          echo "==> Kernel headers installed at $$KDIR"
+        else
+          echo "==> Kernel headers already present at $$KDIR"
+        fi
+
+        # Point the modules build symlink to our extracted headers
+        ln -sfn "$$KDIR" "/lib/modules/$$KVER/build" 2>/dev/null || true
+
+        # Copy the monitor script if it exists in the workspace
+        if [ -f /workspace/ebpf_kernel_monitor.py ]; then
+          echo "==> eBPF monitor script found at /workspace/ebpf_kernel_monitor.py"
+        fi
+
+        echo ""
+        echo "================================================"
+        echo "  eBPF Lab Ready"
+        echo "  Kernel: $$KVER ($$ARCH)"
+        echo "  bpftrace: $$(bpftrace --version 2>/dev/null)"
+        echo "  clang: $$(clang --version 2>/dev/null | head -1)"
+        echo "================================================"
+        echo ""
+        echo "Run:  python3 /workspace/ebpf_kernel_monitor.py"
+        echo ""
+        exec bash
